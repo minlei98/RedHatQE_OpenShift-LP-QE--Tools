@@ -45,7 +45,7 @@ case "$1" in
     fi ;;
   exec)
     if [[ "$*" == *Get-ChildItem* ]]; then echo '[]'
-    else echo '{"windows":true,"dumpParent":true,"minidumpParent":true,"notMyFault":true}'
+    else echo '{"windows":true,"dumpParent":true,"notMyFault":true}'
     fi ;;
   *) exit 91 ;;
 esac
@@ -131,17 +131,13 @@ run_preflight() {
   [ "$status" -ne 0 ]; [[ "$output" == *'does not map uniquely'* ]]
 }
 
-@test "preflight accepts unused --recovery-image without probing" {
+@test "preflight rejects --recovery-image as unknown" {
   export EVIDENCE_ROOT="$BATS_TMPDIR/evidence" OC_LOG="$BATS_TMPDIR/oc.log"
   mkdir "$EVIDENCE_ROOT"; echo fixture-evidence-pvc > "$EVIDENCE_ROOT/.bsod-storage-identity"; make_preflight_mocks
   PREFLIGHT_EXTRA=(--recovery-image 'registry.test/recovery@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
   run_preflight
-  [ "$status" -eq 0 ]
-  metadata="$EVIDENCE_ROOT/fixture-run-001/recovery-metadata.json"
-  [ -f "$metadata" ]
-  [ "$(jq -r '.recoveryImage // empty' "$metadata")" = '' ]
-  ! grep -q '^apply -f' "$OC_LOG"
-  ! grep -q 'bsod-probe-' "$OC_LOG"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'unknown argument: --recovery-image'* ]]
 }
 
 @test "preflight rejects rebootRequired guest dump configuration" {
