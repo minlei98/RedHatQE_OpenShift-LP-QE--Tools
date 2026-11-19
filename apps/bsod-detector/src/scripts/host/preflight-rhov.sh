@@ -9,8 +9,9 @@
 set -euxo pipefail; shopt -s inherit_errexit
 umask 077
 
-typeset scriptDir=''; scriptDir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-typeset appDir=''; appDir="$(cd "${scriptDir}/../../.." && pwd)"
+typeset scrDir="${BASH_SOURCE[0]%/*}"
+typeset scrName="${BASH_SOURCE[0]##*/}"
+typeset appDir="${scrDir}/../../.."
 # BSOD_DET__VALIDATE__CRASH_SETTINGS overrides the read-only guest validator path.
 # BSOD_DET__CONFIGURE__DUMPS is a deprecated alias kept for existing callers; it must name a copy of
 # validate-crash-settings.ps1 (any other file name is refused before anything runs, and the output
@@ -23,67 +24,89 @@ typeset diskTarget=''; typeset memoryPvc="${BSOD_DET__MEMORY__DUMP_PVC:-}"; type
 typeset evidenceRoot="${BSOD_DET__EVIDENCE__MOUNT:-}"; typeset evidenceKind="${BSOD_EVIDENCE_VOLUME_KIND:-}"
 typeset evidenceId="${BSOD_DET__EVIDENCE__STORAGE_ID:-}"
 typeset probePod=''; typeset probeCreated=0; typeset temporaryDir=''
-typeset -a guestAgent=(python3 "${scriptDir}/guest-agent.py")
+typeset -a guestAgent=(python3 "${scrDir}/guest-agent.py")
 [[ -z "${BSOD_DET__GUEST_AGENT__BIN:-}" ]] || guestAgent=("${BSOD_DET__GUEST_AGENT__BIN}")
 
-function Die () { echo "preflight-rhov: ERROR: $*" >&2; exit 1; }
-function RequireCommand () { command -v "$1" >/dev/null 2>&1 || Die "required local tool '$1' is not installed"; }
-function ValidName () { [[ "$1" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || Die "$2 '$1' is not a valid Kubernetes DNS label"; }
-# RunTimed — used only for tools without built-in timeout flags (python3, virtctl, findmnt).
-# For oc API calls, use oc --request-timeout directly.
-function RunTimed () { typeset seconds="${1:?}"; shift; timeout --signal=TERM --kill-after=5 "${seconds}" "$@"; }
-function Cleanup () {
-  if ((probeCreated)); then
-    oc --request-timeout=20s delete pod "${probePod}" -n "${ns}" --ignore-not-found --wait=true --timeout=15s >/dev/null 2>&1 || true
-    probeCreated=0
-  fi
-  [[ -z "${temporaryDir}" ]] || rm -rf "${temporaryDir}"
-  true
+function Die () {
+    : "preflight-rhov: ERROR: $*"
+    false
 }
-function OnSignal () { typeset status="${1:?}"; exit "${status}"; }
+function RequireCommand () {
+    typeset tool="${1:?}"; (($#)) && shift
+    command -v "${tool}" 1> /dev/null || Die "required local tool '${tool}' is not installed"
+    true
+}
+function ValidName () {
+    typeset value="${1:?}"; (($#)) && shift
+    typeset label="${1:?}"; (($#)) && shift
+    [[ "${value}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || Die "${label} '${value}' is not a valid Kubernetes DNS label"
+    true
+}
+# RunTimed — tools without built-in timeout flags (python3, virtctl, findmnt).
+# For oc API calls, use oc --request-timeout directly.
+function RunTimed () {
+    typeset seconds="${1:?}"; (($#)) && shift
+    timeout --signal=TERM --kill-after=5 "${seconds}" "$@"
+}
+function Cleanup () {
+    if ((probeCreated)); then
+        oc --request-timeout=20s delete pod "${probePod}" -n "${ns}" --ignore-not-found --wait=true --timeout=15s 1> /dev/null 2>&1 || true
+        probeCreated=0
+    fi
+    [ -z "${temporaryDir}" ] || rm -rf "${temporaryDir}"
+    true
+}
+function OnSignal () {
+    typeset status="${1:?}"; (($#)) && shift
+    exit "${status}"
+}
 # validate-crash-settings.ps1 arguments; the latest NotMyFault is staged only for an intentional trigger.
 function ValidatorArgs () {
-  typeset -n argArr="${1:?}"; typeset isTriggerRequired="${2:?}"
-  argArr=(-dataFile 'C:\Windows\Temp\crash-control.json')
-  ((isTriggerRequired == 0)) || argArr+=(-stageNotMyFault)
-  true
+    typeset -n argArr="${1:?}"; (($#)) && shift
+    typeset isTriggerRequired="${1:?}"; (($#)) && shift
+    argArr=(-dataFile 'C:\Windows\Temp\crash-control.json')
+    ((isTriggerRequired == 0)) || argArr+=(-stageNotMyFault)
+    true
 }
 # True when the JSON is a validate-crash-settings.ps1 result that matches the golden image.
 function ValidationAccepted () {
-  jq -e '.script == "validate-crash-settings.ps1" and .action == "validated" and .ok == true and
-    .matchesRecommended == true and .current.AutoReboot == 0 and .pageFile.adequate == true' <<<"${1-}" >/dev/null 2>&1
+    typeset json="${1-}"; (($#)) && shift
+    jq -e '.script == "validate-crash-settings.ps1" and .action == "validated" and .ok == true and
+      .matchesRecommended == true and .current.AutoReboot == 0 and .pageFile.adequate == true' <<<"${json}" 1> /dev/null 2>&1
 }
 # True when the validator staged NotMyFault from the official HTTPS host with both SHA-256 values.
 function NotMyFaultStaged () {
-  jq -e '.notMyFault.status == "staged" and (.notMyFault.sha256 | test("^[0-9A-Fa-f]{64}$")) and
-    (.notMyFault.archiveSHA256 | test("^[0-9A-Fa-f]{64}$")) and
-    (.notMyFault.resolvedSource | startswith("https://download.sysinternals.com/")) and
-    .notMyFault.stagedPath == "C:\\Temp\\nmf\\notmyfaultc64.exe"' <<<"${1-}" >/dev/null 2>&1
+    typeset json="${1-}"; (($#)) && shift
+    jq -e '.notMyFault.status == "staged" and (.notMyFault.sha256 | test("^[0-9A-Fa-f]{64}$")) and
+      (.notMyFault.archiveSHA256 | test("^[0-9A-Fa-f]{64}$")) and
+      (.notMyFault.resolvedSource | startswith("https://download.sysinternals.com/")) and
+      .notMyFault.stagedPath == "C:\\Temp\\nmf\\notmyfaultc64.exe"' <<<"${json}" 1> /dev/null 2>&1
 }
 trap Cleanup EXIT
 trap 'OnSignal 130' INT
 trap 'OnSignal 143' TERM
 
 while (($#)); do
-  case "$1" in
-    --ns) ns="${2:?}"; shift 2 ;;
-    --vm) vm="${2:?}"; shift 2 ;;
-    --out) outDir="${2:?}"; shift 2 ;;
-    --metadata) metadataFile="${2:?}"; shift 2 ;;
-    --run-id) runId="${2:?}"; shift 2 ;;
-    --evidence-mount) evidenceRoot="${2:?}"; shift 2 ;;
-    --evidence-volume-kind) evidenceKind="${2:?}"; shift 2 ;;
-    --evidence-storage-id) evidenceId="${2:?}"; shift 2 ;;
-    --snap-class) snapClass="${2:?}"; shift 2 ;;
-    --recovery-image) recoveryImage="${2:?}"; shift 2 ;;
-    --memory-dump-pvc) memoryPvc="${2:?}"; shift 2 ;;
-    --disk-target) diskTarget="${2:?}"; shift 2 ;;
-    --require-trigger) requireTrigger=1; shift ;;
-    -h|--help)
-      echo 'usage: preflight-rhov.sh --ns NS --vm VM --out RUN_DIR --metadata FILE --run-id ID --evidence-mount MOUNT --evidence-volume-kind pvc|network|csi --evidence-storage-id ID --snap-class CLASS --recovery-image IMAGE@sha256:DIGEST --memory-dump-pvc PVC [--disk-target vda] [--require-trigger]'
-      exit 0 ;;
-    *) Die "unknown argument: $1" ;;
-  esac
+    case "${1}" in
+      (--ns) ns="${2:?}"; shift 2;;
+      (--vm) vm="${2:?}"; shift 2;;
+      (--out) outDir="${2:?}"; shift 2;;
+      (--metadata) metadataFile="${2:?}"; shift 2;;
+      (--run-id) runId="${2:?}"; shift 2;;
+      (--evidence-mount) evidenceRoot="${2:?}"; shift 2;;
+      (--evidence-volume-kind) evidenceKind="${2:?}"; shift 2;;
+      (--evidence-storage-id) evidenceId="${2:?}"; shift 2;;
+      (--snap-class) snapClass="${2:?}"; shift 2;;
+      (--recovery-image) recoveryImage="${2:?}"; shift 2;;
+      (--memory-dump-pvc) memoryPvc="${2:?}"; shift 2;;
+      (--disk-target) diskTarget="${2:?}"; shift 2;;
+      (--require-trigger) requireTrigger=1; shift;;
+      (-h|--help)
+        echo "usage: ${scrName} --ns NS --vm VM --out RUN_DIR --metadata FILE --run-id ID --evidence-mount MOUNT --evidence-volume-kind pvc|network|csi --evidence-storage-id ID --snap-class CLASS --recovery-image IMAGE --memory-dump-pvc PVC [--disk-target vda] [--require-trigger]"
+        exit 0
+        ;;
+      (*) Die "unknown argument: ${1}";;
+    esac
 done
 
 [[ -n "${ns}" && -n "${vm}" && -n "${outDir}" && -n "${metadataFile}" && -n "${runId}" ]] || Die '--ns, --vm, --out, --metadata, and --run-id are required'
@@ -104,17 +127,17 @@ typeset -a requiredHelpers=(
 )
 typeset helper=''
 for helper in "${requiredHelpers[@]}"; do
-    [[ -r "${scriptDir}/${helper}" ]] || Die "required helper missing: ${scriptDir}/${helper}"
+    [[ -r "${scrDir}/${helper}" ]] || Die "required helper missing: ${scrDir}/${helper}"
 done
 # Also verify every non-.bak helper currently in host/ is readable.
 while IFS= read -r helper; do
     [[ -r "${helper}" ]] || Die "required helper missing: ${helper}"
-done < <(find "${scriptDir}" -maxdepth 1 -type f ! -name '*.bak' \( -name '*.sh' -o -name '*.py' \) 2>/dev/null)
+done < <(find "${scrDir}" -maxdepth 1 -type f ! -name '*.bak' \( -name '*.sh' -o -name '*.py' \) 2>/dev/null)
 [[ -r "${validatorScript}" && -r "${crashControlFile}" ]] || Die 'guest validation inputs are missing'
 [[ "${validatorScript##*/}" == validate-crash-settings.ps1 ]] || \
   Die "refusing to run ${validatorScript}: the guest validator must be validate-crash-settings.ps1"
 if [[ -n "${BSOD_DET__CONFIGURE__DUMPS:-}" && -z "${BSOD_DET__VALIDATE__CRASH_SETTINGS:-}" ]]; then
-  echo 'preflight-rhov: WARN: BSOD_DET__CONFIGURE__DUMPS is deprecated; set BSOD_DET__VALIDATE__CRASH_SETTINGS instead' >&2
+  : 'preflight-rhov: WARN: BSOD_DET__CONFIGURE__DUMPS is deprecated; set BSOD_DET__VALIDATE__CRASH_SETTINGS instead'
 fi
 RunTimed 10 virtctl memory-dump get --help >/dev/null || Die 'virtctl does not provide memory-dump get'
 RunTimed 10 virtctl memory-dump download --help >/dev/null || Die 'virtctl does not provide memory-dump download'
@@ -125,7 +148,7 @@ typeset identityMarker="${evidenceRoot}/.bsod-storage-identity"
 typeset testMode=0
 
 if [[ -f "${identityMarker}" && ! -L "${identityMarker}" && "$(<"${identityMarker}")" == "${evidenceId}" ]]; then
-  echo "preflight-rhov: evidence storage validated (identity marker present, test mode)"
+  : 'preflight-rhov: evidence storage validated (identity marker present, test mode)'
   testMode=1
 fi
 
@@ -151,7 +174,7 @@ typeset evidencePvcMissing=0
 if ((testMode == 0)) || [[ "${evidenceKind}" != network ]]; then
   ValidName "${evidenceId}" evidence-PVC
   if ! oc --request-timeout=30s get pvc "${evidenceId}" -n "${ns}" &>/dev/null 2>&1; then
-    echo "preflight-rhov: evidence PVC ${evidenceId} not found — will auto-create after guest disk storage class is identified"
+    : "preflight-rhov: evidence PVC ${evidenceId} not found — will auto-create after guest disk storage class is identified"
     evidencePvcMissing=1
   fi
 fi
@@ -182,7 +205,7 @@ typeset dom="${ns}_${vm}"
 oc --request-timeout=30s exec -n "${ns}" "${pod}" -- virsh dumpxml "${dom}" > "${xmlFile}" || Die 'cannot read libvirt domain XML for disk/PVC correlation'
 
 typeset -a mapArgs=(--vmi-json "${vmiFile}" --domain-xml "${xmlFile}"); [[ -n "${diskTarget}" ]] && mapArgs+=(--target "${diskTarget}")
-typeset mapping=''; mapping="$(RunTimed 15 python3 "${scriptDir}/reliability.py" map-disk "${mapArgs[@]}")" || Die 'selected libvirt target does not map uniquely to a VMI PVC/DataVolume'
+typeset mapping=''; mapping="$(RunTimed 15 python3 "${scrDir}/reliability.py" map-disk "${mapArgs[@]}")" || Die 'selected libvirt target does not map uniquely to a VMI PVC/DataVolume'
 typeset guestPvc=''; guestPvc="$(jq -er .guestPvc <<<"${mapping}")"; diskTarget="$(jq -er .diskTarget <<<"${mapping}")"
 typeset diskName=''; diskName="$(jq -er .diskName <<<"${mapping}")"; ValidName "${guestPvc}" guest-PVC
 
@@ -194,19 +217,22 @@ typeset storageSize=''; storageSize="$(jq -r '.spec.resources.requests.storage /
 
 # Auto-create memory-dump PVC if missing — same size and storage class as guest disk.
 function EnsureMemoryDumpPVC () {
-  typeset pvc="${1:?}"; typeset ns="${2:?}"; typeset storageClass="${3:?}"; typeset storageSize="${4:?}"
-  if oc --request-timeout=30s get pvc "${pvc}" -n "${ns}" &>/dev/null 2>&1; then
-    echo "memory-dump PVC ${pvc} already exists"; return 0
+  typeset pvc="${1:?}"; (($#)) && shift
+  typeset nsArg="${1:?}"; (($#)) && shift
+  typeset storageClass="${1:?}"; (($#)) && shift
+  typeset storageSize="${1:?}"; (($#)) && shift
+  if oc --request-timeout=30s get pvc "${pvc}" -n "${nsArg}" &>/dev/null 2>&1; then
+    : "memory-dump PVC ${pvc} already exists"; return 0
   fi
-  echo "creating memory-dump PVC ${pvc} with ${storageSize} in storage class ${storageClass}"
-  jq -n --arg name "${pvc}" --arg ns "${ns}" --arg sc "${storageClass}" --arg size "${storageSize}" \
+  : "creating memory-dump PVC ${pvc} with ${storageSize} in storage class ${storageClass}"
+  jq -n --arg name "${pvc}" --arg ns "${nsArg}" --arg sc "${storageClass}" --arg size "${storageSize}" \
     '{apiVersion:"v1",kind:"PersistentVolumeClaim",metadata:{name:$name,namespace:$ns},spec:{accessModes:["ReadWriteOnce"],storageClassName:$sc,resources:{requests:{storage:$size}},volumeMode:"Filesystem"}}' |
     oc --request-timeout=30s apply -f - 2>&1 || Die "failed to create memory-dump PVC ${pvc}"
   typeset deadline=$((SECONDS + 120)); typeset phase=''
   while ((SECONDS < deadline)); do
-    phase="$(oc --request-timeout=30s get pvc "${pvc}" -n "${ns}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    phase="$(oc --request-timeout=30s get pvc "${pvc}" -n "${nsArg}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
     [[ "${phase}" == Bound ]] && return 0
-    echo "waiting for PVC ${pvc} to bind (current phase: ${phase})"
+    : "waiting for PVC ${pvc} to bind (current phase: ${phase})"
     sleep 5
   done
   Die "memory-dump PVC ${pvc} failed to bind within 120 seconds"
@@ -214,20 +240,22 @@ function EnsureMemoryDumpPVC () {
 
 # Auto-create evidence PVC if missing — sized to hold multiple run evidence dirs.
 function EnsureEvidencePVC () {
-  typeset pvc="${1:?}"; typeset ns="${2:?}"; typeset storageClass="${3:?}"
-  if oc --request-timeout=30s get pvc "${pvc}" -n "${ns}" &>/dev/null 2>&1; then
-    echo "evidence PVC ${pvc} already exists"; return 0
+  typeset pvc="${1:?}"; (($#)) && shift
+  typeset nsArg="${1:?}"; (($#)) && shift
+  typeset storageClass="${1:?}"; (($#)) && shift
+  if oc --request-timeout=30s get pvc "${pvc}" -n "${nsArg}" &>/dev/null 2>&1; then
+    : "evidence PVC ${pvc} already exists"; return 0
   fi
   typeset size="${BSOD_DET__EVIDENCE__STORAGE_SIZE:-200Gi}"
-  echo "creating evidence PVC ${pvc} (${size}) in storage class ${storageClass}"
-  jq -n --arg name "${pvc}" --arg ns "${ns}" --arg sc "${storageClass}" --arg size "${size}" \
+  : "creating evidence PVC ${pvc} (${size}) in storage class ${storageClass}"
+  jq -n --arg name "${pvc}" --arg ns "${nsArg}" --arg sc "${storageClass}" --arg size "${size}" \
     '{apiVersion:"v1",kind:"PersistentVolumeClaim",metadata:{name:$name,namespace:$ns},spec:{accessModes:["ReadWriteOnce"],storageClassName:$sc,resources:{requests:{storage:$size}},volumeMode:"Filesystem"}}' |
     oc --request-timeout=30s apply -f - 2>&1 || Die "failed to create evidence PVC ${pvc}"
   typeset deadline=$((SECONDS + 120)); typeset phase=''
   while ((SECONDS < deadline)); do
-    phase="$(oc --request-timeout=30s get pvc "${pvc}" -n "${ns}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    phase="$(oc --request-timeout=30s get pvc "${pvc}" -n "${nsArg}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
     [[ "${phase}" == Bound ]] && return 0
-    echo "waiting for evidence PVC ${pvc} to bind (current phase: ${phase})"
+    : "waiting for evidence PVC ${pvc} to bind (current phase: ${phase})"
     sleep 5
   done
   Die "evidence PVC ${pvc} failed to bind within 120 seconds"
@@ -288,10 +316,10 @@ export BSOD_DET__NAMESPACE="${ns}" BSOD_DET__VM__NAME="${vm}" BSOD_DET__POD__NAM
 # The QEMU guest agent is installed and checked in the golden image (golden-image-pre-reboot.ps1
 # installs it, golden-image-post-reboot.ps1 refuses to seal without it). There is no bootstrap:
 # installing the agent needs a responding agent, so an unresponsive agent is a golden-image problem.
-typeset pingOk=0
+typeset pingOk=0 i=''
 for i in $(seq 1 5); do
   if RunTimed 15 "${guestAgent[@]}" ping >/dev/null 2>&1; then pingOk=1; break; fi
-  echo "qemu guest agent ping attempt $i failed; retrying..." >&2
+  : "qemu guest agent ping attempt ${i} failed; retrying..."
   sleep 3
 done
 
@@ -344,6 +372,6 @@ jq -n --arg runId "${runId}" --arg outputDir "${outDir}" --arg namespace "${ns}"
     evidenceMount:{target:$mountTarget,source:$mountSource,fsType:$mountFs,device:$mountDevice,kind:$mountKind,id:$mountId}}' > "${temporary}"
 chmod 0600 "${temporary}"; mv -f "${temporary}" "${metadataFile}"
 
-echo "preflight-rhov: OK: ${ns}/${vm}; run=${runId}; disk=${diskTarget}/${diskName}; PVC=${guestPvc}; evidence=${mountTarget} (${evidenceId})"
+: "preflight-rhov: OK: ${ns}/${vm}; run=${runId}; disk=${diskTarget}/${diskName}; PVC=${guestPvc}; evidence=${mountTarget} (${evidenceId})"
 
 true
