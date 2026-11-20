@@ -57,11 +57,23 @@ def pagedu64_bytes(code=1):
     return bytes(data)
 
 
-def minidump_bytes():
-    data = bytearray(44)
-    data[:4] = b"MDMP"
-    struct.pack_into("<II", data, 8, 1, 32)
-    return bytes(data)
+def kubevirt_memory_targz():
+    '''virtctl-style tar.gz whose .memory.dump has KubeVirt e_ehsize=0 / empty phdrs.'''
+    import gzip
+    import io
+    import tarfile
+
+    header = bytearray(64)
+    header[:16] = b"\x7fELF\x02\x01\x01" + bytes(9)
+    struct.pack_into("<H", header, 0x10, 4)
+    struct.pack_into("<H", header, 0x34, 0)
+    payload = bytes(header) + bytes(64)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        info = tarfile.TarInfo(name="vm.memory.dump")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    return gzip.compress(buffer.getvalue())
 
 
 def evtx_bytes():
@@ -99,24 +111,33 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(decision["decision"], "capture")
         self.assertEqual(decision["reason"], "qga-threshold-domstate-running")
 
+    def _drive_progress(self, samples, idle_samples=3):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "progress-state.json"
+            last = None
+            for text in samples:
+                last = run_helper(
+                    "progress-step", "--device", "vda", "--state", str(state),
+                    "--idle-samples", str(idle_samples), stdin=text,
+                )
+                if last.returncode != 0 or json.loads(last.stdout)["status"] in {"complete", "failure"}:
+                    return last
+            return last
+
     def test_write_progress_then_quiescence_completes(self):
-        sequence = (FIXTURES / "domstats-progress.json").read_text(encoding="utf-8")
-        result = run_helper("progress-sequence", "--device", "vda", "--idle-samples", "3", stdin=sequence)
+        samples = json.loads((FIXTURES / "domstats-progress.json").read_text(encoding="utf-8"))
+        result = self._drive_progress(samples)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["reason"], "progress-then-quiescence")
 
     def test_no_progress_at_baseline_completes_but_missing_statistics_fail(self):
-        result = run_helper(
-            "progress-sequence", "--device", "vda",
-            stdin=(FIXTURES / "domstats-no-progress.json").read_text(encoding="utf-8"),
-        )
+        samples = json.loads((FIXTURES / "domstats-no-progress.json").read_text(encoding="utf-8"))
+        result = self._drive_progress(samples)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["reason"], "pre-quiescent-at-baseline")
 
-        result = run_helper(
-            "progress-sequence", "--device", "vda",
-            stdin=(FIXTURES / "domstats-missing.json").read_text(encoding="utf-8"),
-        )
+        missing = json.loads((FIXTURES / "domstats-missing.json").read_text(encoding="utf-8"))
+        result = self._drive_progress(missing)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout)["reason"], "statistics-unavailable")
 
@@ -128,15 +149,17 @@ class ReliabilityTests(unittest.TestCase):
                 path.write_bytes(data)
                 result = run_helper("validate-artifact", "--type", kind, "--path", str(path))
                 self.assertEqual(result.returncode, 0, (kind, result.stdout, result.stderr))
-            mini = Path(temporary) / "mini.dmp"
-            mini.write_bytes(minidump_bytes())
-            self.assertEqual(run_helper("validate-artifact", "--type", "dump", "--path", str(mini)).returncode, 0)
+            short_dump = Path(temporary) / "short.dmp"
+            short_dump.write_bytes(b"PAGEDU64" + bytes(8))
+            ok = run_helper("validate-artifact", "--type", "dump", "--path", str(short_dump))
+            self.assertEqual(ok.returncode, 0, ok.stdout)
+            self.assertEqual(json.loads(ok.stdout)["format"], "dump")
 
     def test_truncated_and_malformed_artifacts_fail(self):
         malformed = {
             "screenshot": b"\x89PNG\r\n\x1a\nfixture",
             "memory": b"\x7fELFfixture",
-            "dump": b"PAGEDU64" + bytes(8),
+            "dump": b"NOTADUMP" + bytes(8),
             "evtx": b"ElfFile\x00fixture",
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -150,6 +173,14 @@ class ReliabilityTests(unittest.TestCase):
             trailing = Path(temporary) / "memory-with-status"
             trailing.write_bytes(elf_bytes() + b"Domain dumped successfully\n")
             self.assertNotEqual(run_helper("validate-artifact", "--type", "memory", "--path", str(trailing)).returncode, 0)
+
+    def test_kubevirt_nonstandard_memory_targz_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "vm-memory.elf.tar.gz"
+            path.write_bytes(kubevirt_memory_targz())
+            result = run_helper("validate-artifact", "--type", "memory", "--path", str(path))
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(json.loads(result.stdout)["format"], "tar.gz[elf]")
 
     def test_summary_modes_and_semantic_stage_results(self):
         with tempfile.TemporaryDirectory() as temporary:

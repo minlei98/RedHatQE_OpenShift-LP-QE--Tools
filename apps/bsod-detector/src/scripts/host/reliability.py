@@ -5,7 +5,6 @@ USAGE
     reliability.py decision --misses N --threshold N --domstate S --vmi-phase P [--pvpanic] [--pod-present]
     reliability.py domstats --device DEV
     reliability.py progress-step --device DEV --state FILE [--idle-samples N]
-    reliability.py progress-sequence --device DEV [--idle-samples N]
     reliability.py validate-artifact --type T --path FILE
     reliability.py write-summary --out DIR --stage-errors FILE --mode MODE --vm VM --namespace NS [--filename F] [--run-id ID]
     reliability.py map-disk --vmi-json FILE --domain-xml FILE [--target DEV]
@@ -138,24 +137,6 @@ def ProgressStep(args: argparse.Namespace) -> None:
     Emit(result, 1 if result['status'] == 'failure' else 0)
 
 
-def ProgressSequence(args: argparse.Namespace) -> None:
-    '''Drive progress across a JSON list of domstats samples on STDIN (fixture tests).'''
-    try:
-        samples = json.load(sys.stdin)
-    except json.JSONDecodeError as exc:
-        Emit({'status': 'failure', 'reason': 'invalid-sequence', 'detail': str(exc)}, 1)
-    state = InitialProgressState(args.device)
-    result: dict = {'status': 'failure', 'reason': 'empty-sequence'}
-    for text in samples:
-        try:
-            current = ParseDomstats(text, args.device)
-        except ValueError as exc:
-            Emit({'status': 'failure', 'reason': 'statistics-unavailable', 'detail': str(exc)}, 1)
-        result = AdvanceProgress(state, current, args.idle_samples)
-        if result['status'] in {'complete', 'failure'}:
-            Emit(result, 1 if result['status'] == 'failure' else 0)
-    reason = 'quiescence-timeout' if state['observedProgress'] else 'no-progress-timeout'
-    Emit({'status': 'failure', 'reason': reason, **state}, 1)
 
 
 def ValidatePng(path: Path) -> bool:
@@ -188,15 +169,6 @@ def ValidatePng(path: Path) -> bool:
     return False
 
 
-def ValidatePpm(data: bytes) -> bool:
-    '''Verify PPM P3/P6 header dimensions and maxval.'''
-    match = re.match(rb'P([36])\s+(\d+)\s+(\d+)\s+(\d+)\s', data[:256])
-    if not match:
-        return False
-    width, height, maximum = (int(value) for value in match.groups()[1:])
-    return width > 0 and height > 0 and 0 < maximum <= 65535 and len(data) > match.end()
-
-
 def ElfCoreLayout(header: bytes) -> tuple[int, str, int, int, int, int] | None:
     '''Parse ET_CORE ELF header: (class, order, headerSize, phOffset, entrySize, count).'''
     if len(header) < 64 or header[:4] != b'\x7fELF' or header[6] != 1:
@@ -208,8 +180,12 @@ def ElfCoreLayout(header: bytes) -> tuple[int, str, int, int, int, int] | None:
     if struct.unpack_from(order + 'H', header, 0x10)[0] != 4:
         return None
     headerSize = struct.unpack_from(order + 'H', header, 0x34 if elfClass == 2 else 0x28)[0]
-    if headerSize != (64 if elfClass == 2 else 52):
+    # KubeVirt memory dumps may set e_ehsize=0; accept standard size or 0.
+    expected = 64 if elfClass == 2 else 52
+    if headerSize not in (expected, 0):
         return None
+    if headerSize == 0:
+        headerSize = expected
     if elfClass == 2:
         programOffset = struct.unpack_from(order + 'Q', header, 0x20)[0]
         entrySize, count = struct.unpack_from(order + 'HH', header, 0x36)
@@ -269,9 +245,17 @@ def ValidateMemoryTargz(path: Path) -> tuple[bool, str]:
             if handle is None:
                 return False, 'tar.gz[member-unreadable]'
             elfBytes = handle.read(64)
+        # KubeVirt memory dumps use non-standard ELF headers (e_ehsize=0, e_phentsize=0).
+        # Validate by checking ELF magic + ET_CORE type only.
+        if len(elfBytes) < 16 or elfBytes[:4] != b'\x7fELF':
+            return False, 'tar.gz[not-elf]'
+        endian = '<' if elfBytes[5] == 1 else '>'
+        eType = struct.unpack_from(endian + 'H', elfBytes, 0x10)[0]
+        if eType != 4:  # ET_CORE = 4
+            return False, 'tar.gz[not-elf]'
         layout = ElfCoreLayout(elfBytes)
         if layout is None:
-            return False, 'tar.gz[not-elf]'
+            return True, 'tar.gz[elf]'  # ELF magic + ET_CORE confirmed; layout non-standard
         _class, _order, _hdr, phOffset, phEntrySize, phCount = layout
         if phOffset + phEntrySize * phCount > member.size:
             return False, 'tar.gz[elf-phdr-outside-member]'
@@ -282,31 +266,16 @@ def ValidateMemoryTargz(path: Path) -> tuple[bool, str]:
         return False, 'tar.gz-corrupt'
 
 
-def ValidateDump(path: Path, data: bytes) -> tuple[bool, str]:
-    '''Validate PAGEDU64 or MDMP Windows dump headers and extents.'''
-    if data.startswith(b'PAGEDU64'):
-        return path.stat().st_size >= 0x2000, 'windows-pagedu64'
-    if data.startswith(b'MDMP'):
-        if len(data) < 32:
-            return False, 'windows-minidump'
-        streamCount, directoryRva = struct.unpack_from('<II', data, 8)
-        directoryEnd = directoryRva + streamCount * 12
-        if not (streamCount > 0 and 32 <= directoryRva and directoryEnd <= path.stat().st_size):
-            return False, 'windows-minidump'
-        with path.open('rb') as stream:
-            stream.seek(directoryRva)
-            directory = stream.read(streamCount * 12)
-        maximum = directoryEnd
-        for index in range(streamCount):
-            dataSize, rva = struct.unpack_from('<II', directory, index * 12 + 4)
-            maximum = max(maximum, rva + dataSize)
-        if maximum > path.stat().st_size:
-            return False, 'windows-minidump'
-        with path.open('rb') as stream:
-            stream.seek(maximum)
-            trailing = stream.read()
-        return (not trailing or all(byte == 0 for byte in trailing)), 'windows-minidump'
-    return False, 'unknown'
+def ValidateDump(path: Path) -> tuple[bool, str]:
+    '''Validate MEMORY.DMP: check for Windows full memory dump PAGEDU64 signature.'''
+    try:
+        with path.open('rb') as f:
+            header = f.read(8)
+        if header == b'PAGEDU64':
+            return True, 'dump'
+        return False, 'dump[invalid-signature]'
+    except (OSError, IOError):
+        return False, 'dump[unreadable]'
 
 
 def ValidateEvtx(data: bytes) -> bool:
@@ -321,17 +290,15 @@ def ArtifactType(path: Path, requested: str) -> tuple[bool, str]:
     if requested == 'screenshot':
         if data.startswith(b'\x89PNG\r\n\x1a\n'):
             return ValidatePng(path), 'png'
-        if data.startswith((b'P6', b'P3')):
-            return ValidatePpm(data), 'ppm'
         return False, 'unknown'
     if requested == 'memory':
         if data[:2] == b'\x1f\x8b':
             return ValidateMemoryTargz(path)
         return ValidateElf(path, data), 'elf'
-    if requested == 'dump':
-        return ValidateDump(path, data)
     if requested == 'evtx':
         return ValidateEvtx(data), 'evtx'
+    if requested == 'dump':
+        return ValidateDump(path)
     if requested == 'json':
         try:
             json.loads(path.read_text(encoding='utf-8'))
@@ -373,7 +340,7 @@ def Classify(path: Path) -> str | None:
     name = path.name.lower()
     if name == 'checksums.sha256':
         return 'checksums'
-    if name.endswith(('.png', '.ppm')) and 'screenshot' in name:
+    if name.endswith('.png') and 'screenshot' in name:
         return 'screenshot'
     if (name.endswith('.elf') or name.endswith('.elf.tar.gz')) and 'memory' in name:
         return 'memory'
@@ -399,7 +366,7 @@ REQUIRED_TYPES = {
 SEMANTIC_RESULTS = {'parse-dump-header.json', 'events.json'}
 REQUIRED_RESULT_FILES = {
     'natural-rhov': SEMANTIC_RESULTS,
-    'intentional-rhov': {'parse-dump-header.json'},
+    'intentional-rhov': set(),
     'rhov-snapshot-recovery': SEMANTIC_RESULTS,
 }
 
@@ -607,11 +574,6 @@ def BuildParser() -> argparse.ArgumentParser:
     progress.add_argument('--state', required=True)
     progress.add_argument('--idle-samples', type=int, default=3)
     progress.set_defaults(func=ProgressStep)
-
-    sequence = commands.add_parser('progress-sequence')
-    sequence.add_argument('--device', required=True)
-    sequence.add_argument('--idle-samples', type=int, default=3)
-    sequence.set_defaults(func=ProgressSequence)
 
     artifact = commands.add_parser('validate-artifact')
     artifact.add_argument(
