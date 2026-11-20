@@ -262,6 +262,8 @@ def ValidateMemoryTargz(path: Path) -> tuple[bool, str]:
         return True, 'tar.gz[elf]'
     except (tarfile.TarError, EOFError, OSError, struct.error):
         return False, 'tar.gz-corrupt'
+    except Exception:
+        return False, 'tar.gz-corrupt'
 
 
 def ValidateDump(path: Path) -> tuple[bool, str]:
