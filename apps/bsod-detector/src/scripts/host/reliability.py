@@ -262,19 +262,17 @@ def ValidateMemoryTargz(path: Path) -> tuple[bool, str]:
         return True, 'tar.gz[elf]'
     except (tarfile.TarError, EOFError, OSError, struct.error):
         return False, 'tar.gz-corrupt'
-    except Exception:
-        return False, 'tar.gz-corrupt'
 
 
 def ValidateDump(path: Path) -> tuple[bool, str]:
     '''Validate MEMORY.DMP: check for Windows full memory dump PAGEDU64 signature.'''
     try:
-        with path.open('rb') as f:
-            header = f.read(8)
+        with path.open('rb') as stream:
+            header = stream.read(8)
         if header == b'PAGEDU64':
             return True, 'dump'
         return False, 'dump[invalid-signature]'
-    except (OSError, IOError):
+    except OSError:
         return False, 'dump[unreadable]'
 
 
