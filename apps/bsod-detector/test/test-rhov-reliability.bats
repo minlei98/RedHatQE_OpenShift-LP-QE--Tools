@@ -28,7 +28,7 @@ EOF
   chmod +x "$BATS_TMPDIR/mockbin/python3" "$BATS_TMPDIR/mockbin/findmnt"
 }
 
-# Default validator JSON accepted by ValidationAccepted + NotMyFaultStaged (--require-trigger).
+# Default validator JSON accepted by the guest jq checks when --require-trigger stages NotMyFault.
 PREFLIGHT_OK_JSON='{"script":"validate-crash-settings.ps1","action":"validated","ok":true,"matchesRecommended":true,"current":{"AutoReboot":0},"pageFile":{"adequate":true},"notMyFault":{"status":"staged","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","archiveSHA256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","resolvedSource":"https://download.sysinternals.com/files/NotMyFault.zip","stagedPath":"C:\\Temp\\nmf\\notmyfaultc64.exe"}}'
 
 make_preflight_mocks() {
@@ -143,24 +143,13 @@ run_preflight() {
   [ "$status" -ne 0 ]; [[ "$output" == *'capability probe failed'* ]]
 }
 
-@test "preflight rejects missing required helper" {
+@test "preflight rejects missing guest validation inputs" {
   export EVIDENCE_ROOT="$BATS_TMPDIR/evidence" OC_LOG="$BATS_TMPDIR/oc.log"
   mkdir "$EVIDENCE_ROOT"; echo fixture-evidence-pvc > "$EVIDENCE_ROOT/.bsod-storage-identity"; make_preflight_mocks; PREFLIGHT_EXTRA=()
-  mkdir -p "$BATS_TMPDIR/host-copy"
-  cp -a "$HOST_DIR/." "$BATS_TMPDIR/host-copy/"
-  rm -f "$BATS_TMPDIR/host-copy/collect-host-signals.sh"
-  run env PATH="$BATS_TMPDIR/mockbin:$PATH" REAL_PYTHON="$REAL_PYTHON" EVIDENCE_ROOT="$EVIDENCE_ROOT" \
-    FIXTURE_DIR="$FIXTURES" OC_LOG="$OC_LOG" PREFLIGHT_OK_JSON="$PREFLIGHT_OK_JSON" \
-    BSOD_DET__GUEST_AGENT__BIN="$BATS_TMPDIR/mockbin/guest-agent" \
-    BSOD_DET__VALIDATE__CRASH_SETTINGS="$BATS_TMPDIR/guest/validate-crash-settings.ps1" \
-    bash "$BATS_TMPDIR/host-copy/preflight-rhov.sh" --ns fixture-ns --vm fixture-vm \
-      --out "$EVIDENCE_ROOT/fixture-run-001" --metadata "$EVIDENCE_ROOT/fixture-run-001/recovery-metadata.json" \
-      --run-id fixture-run-001 --evidence-mount "$EVIDENCE_ROOT" --evidence-volume-kind pvc \
-      --evidence-storage-id fixture-evidence-pvc --snap-class fixture-snapshot-class \
-      --recovery-image 'registry.test/recovery@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
-      --memory-dump-pvc fixture-memory --require-trigger
+  rm -f "$BATS_TMPDIR/guest/validate-crash-settings.ps1"
+  run_preflight
   [ "$status" -ne 0 ]
-  [[ "$output" == *'required helper missing'*collect-host-signals.sh* ]]
+  [[ "$output" == *'guest validation inputs are missing'* ]]
 }
 
 @test "preflight remote-command failure is actionable and bounded" {
